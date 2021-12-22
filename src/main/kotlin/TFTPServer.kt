@@ -8,6 +8,7 @@ import kotlin.system.exitProcess
 class TFTPServer(port: Int = 8888, directoryName: String = "TFTPFiles") {
     private val server: DatagramSocket = DatagramSocket(port)   // сокет сервера
     private val workDir: String
+    //todo: Добавить создание ещё одного сокета на новом порту для каждого клиента??
 
     init {
         // Проверка наличия рабочей директории или её создание
@@ -26,6 +27,7 @@ class TFTPServer(port: Int = 8888, directoryName: String = "TFTPFiles") {
         waitRequest()
     }
 
+    /** Ожидаем запрос от клиента **/
     private fun waitRequest() {
         // 516?? 512???
         val getBuffer = ByteArray(516)     // буфер для хранения получаемых данных
@@ -36,26 +38,35 @@ class TFTPServer(port: Int = 8888, directoryName: String = "TFTPFiles") {
 
         println("Клиент прислал: ${inputPacket.data}")
 
-        val packet = processingPacket(inputPacket.data)
+        val packet = processingRequestPacket(inputPacket.data)
 
         when (packet.opcode) {
-            Opcode.RRQ -> sendFile()
+            Opcode.RRQ -> sendFile(inputPacket.address, inputPacket.port, packet.fileName)
             Opcode.WRQ -> getFile(inputPacket.address, inputPacket.port, packet.fileName)
+            else -> TODO()
         }
     }
 
 
+    /** Обрабатывает и возвращает пакет данных **/
     private fun processingDataPacket(data: ByteArray, lastDataIndex: Int): DataPacket {
         val opcode = getOpcode(data.slice(0..1))
+
+        if (opcode != Opcode.DATA)
+            TODO()
+
         val blockNum = data.slice(2..3).toInt()
         val dataB = data.slice(4 until lastDataIndex)
 
         return DataPacket(opcode, blockNum, dataB)
     }
 
-    private fun processingPacket(data: ByteArray): TFTPPacket {
-        val opcodeB = data.slice(0..1)
-        val opcode = getOpcode(opcodeB)
+    /** Обрабатывает и возвращает пакет на запрос скачивания или отправки файла **/
+    private fun processingRequestPacket(data: ByteArray): RequestPacket {
+        val opcode = getOpcode(data.slice(0..1))
+
+        if (opcode != Opcode.WRQ && opcode != Opcode.RRQ)
+            TODO()
 
         val fileNameB = mutableListOf<Byte>()
         var byte = data[2]
@@ -68,7 +79,18 @@ class TFTPServer(port: Int = 8888, directoryName: String = "TFTPFiles") {
         }
 
         val fileName = fileNameB.toByteArray().toString(Charsets.US_ASCII)
-        return TFTPPacket(opcode, fileName, fileNameB)
+        return RequestPacket(opcode, fileName, fileNameB)
+    }
+
+    /** Обрабатывает и возвращает пакет ACK **/
+    private fun processingACKPacket(data: ByteArray): ACKPacket {
+        val opcode = getOpcode(data.slice(0..1))
+
+        if (opcode != Opcode.ACK)
+            TODO()
+
+        val blockNum = data.slice(2..3).toInt()
+        return ACKPacket(opcode, blockNum)
     }
 
     private fun getOpcode(opcodeB: List<Byte>): Opcode {
@@ -109,10 +131,8 @@ class TFTPServer(port: Int = 8888, directoryName: String = "TFTPFiles") {
             if (inputPacket.port != port)
                 TODO("Добавить отправку сообщения об ошибке идентификации (не совпадают TDI)")
 
-
             fileBytes.addAll(packet.dataB)              // Записываем байты файла
             sendACK(address, port, packet.blockNum)     // Подтверждаем получение
-
 
             // Последний пакет будет меньше 516 байт, на нём выходим
             if (inputPacket.length != 516)
@@ -131,8 +151,42 @@ class TFTPServer(port: Int = 8888, directoryName: String = "TFTPFiles") {
     }
 
 
-    private fun sendFile() {    // для RRQ
+    private fun sendFile(address: InetAddress, port: Int, fileName: String) {    // для RRQ
+        val path = workDir + File.separator + fileName
+        val file = File(path)
 
+        if (!file.exists() || file.isDirectory)
+            TODO("Сообщение об отсутствии такого файла")
+
+        var fileBytes = file.readBytes().toList()
+        var sizeToSend = fileBytes.size
+        var blockNum = 1
+
+        while (sizeToSend != 0) {
+            val dataToSend = if (sizeToSend >= 512)
+                fileBytes.slice(0 until 512)
+            else
+                fileBytes.slice(0 until sizeToSend)
+
+            val dataBuff = DataPacket(Opcode.DATA, blockNum, dataToSend).toByteArray()
+            val outputPacket = DatagramPacket(dataBuff, dataBuff.size, address, port)
+            server.send(outputPacket)
+            println("Отправлена часть данных: blockNum = $blockNum")
+
+            // Ждём подтверждения получения
+            val ackAnswer = getACK()
+
+            if (ackAnswer.first != port)
+                TODO("Изменился порт")
+
+            if (ackAnswer.second != blockNum)
+                TODO("Не совпадает блок")
+
+            // Если всё ок
+            fileBytes = fileBytes.drop(dataToSend.size)
+            sizeToSend = fileBytes.size
+            blockNum++
+        }
     }
 
     private fun sendACK(address: InetAddress, port: Int, blockNum: Int) {
@@ -144,8 +198,18 @@ class TFTPServer(port: Int = 8888, directoryName: String = "TFTPFiles") {
         val sendBuffer = byteArrayOf(0.toByte(), Opcode.ACK.opcode.toByte(), numB[0], numB[1])
         val outputPacket = DatagramPacket(sendBuffer, sendBuffer.size, address, port)
 
-        println("Отправлен пакет ACK: ${outputPacket.data}")
         server.send(outputPacket)
+        println("Отправлен пакет ACK: ${outputPacket.data}")
+    }
+
+    private fun getACK(): Pair<Int, Int> {  // Возвращает пару <Порт, номер блока>
+        val buffer = ByteArray(4)
+        val inputPacket = DatagramPacket(buffer, buffer.size)
+        server.receive(inputPacket)
+
+        val ackPacket = processingACKPacket(inputPacket.data)
+
+        return inputPacket.port to ackPacket.blockNum
     }
 
 
@@ -157,7 +221,7 @@ class TFTPServer(port: Int = 8888, directoryName: String = "TFTPFiles") {
         ERROR(5)    // Error
     }
 
-    data class TFTPPacket(
+    data class RequestPacket(
         val opcode: Opcode,
         val fileName: String,
         val fileNameB: List<Byte>
@@ -167,6 +231,17 @@ class TFTPServer(port: Int = 8888, directoryName: String = "TFTPFiles") {
         val opcode: Opcode,
         val blockNum: Int,
         val dataB: List<Byte>
+    ) {
+        fun toByteArray(): ByteArray {
+            val opcodeB = byteArrayOf(0.toByte(), opcode.opcode.toByte())
+            val blockNumB = byteArrayOf((blockNum shr 8).toByte(), blockNum.toByte())
+            return opcodeB + blockNumB + dataB
+        }
+    }
+
+    data class ACKPacket(
+        val opcode: Opcode,
+        val blockNum: Int
     )
 
 //    Пакет
